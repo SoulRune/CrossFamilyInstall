@@ -1,0 +1,89 @@
+name: Build
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ '*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # A macOS Apple Silicon runner is required: the Xcode toolchain provides
+    # arm64e, and installd on A12+ devices is a system daemon that runs as
+    # arm64e specifically. A Linux build (arm64-only) won't inject on such devices.
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: echo "version=$(grep '^Version:' control | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Install tooling
+        run: |
+          brew install ldid dpkg make
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/theos
+          key: theos-macos-v2
+
+      - name: Set up Theos
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          if [ ! -x "$THEOS/bin/logos.pl" ]; then
+            rm -rf "$THEOS"
+            git clone --quiet --recursive https://github.com/theos/theos.git "$THEOS"
+          fi
+          if ! ls "$THEOS"/sdks/iPhoneOS*.sdk >/dev/null 2>&1; then
+            rm -rf "$THEOS/sdks"
+            git clone --quiet --depth=1 https://github.com/theos/sdks.git "$THEOS/sdks"
+          fi
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      # TARGET on the command line is also passed down to the subproject (prefs bundle),
+      # overriding both Makefiles - important to keep the SDK/deployment version in one place.
+      - name: Build rootless .deb (arm64 + arm64e)
+        run: |
+          rm -rf packages
+          make clean || true
+          make package FINALPACKAGE=1 ARCHS="arm64 arm64e" TARGET="iphone:clang:16.5:14.0"
+          mkdir -p dist && cp packages/*.deb dist/
+
+      - name: Build rootful .deb (arm64 + arm64e)
+        run: |
+          rm -rf packages
+          make clean || true
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME= ARCHS="arm64 arm64e" TARGET="iphone:clang:16.5:14.0"
+          cp packages/*.deb dist/
+
+      - name: Upload combined archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: crossfamilyinstall-builds-${{ steps.ver.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.deb
+          fail_on_unmatched_files: true
