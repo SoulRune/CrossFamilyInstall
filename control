@@ -1,8 +1,8 @@
 Package: com.soulrune.crossfamilyinstall
 Name: CrossFamilyInstall
-Version: 0.0.3
+Version: 0.1.0
 Architecture: iphoneos-arm
-Description: Lets install IPAs built for a different device family (iPhone/iPad/tvOS), with a toggle in Settings.
+Description: Install IPAs built for a different device family (iPhone/iPad/tvOS), skip device-model and iOS-version install checks, and spoof model / family / iOS version / RAM / CPU / GPU per installed app.
 Maintainer: SoulRune
 Author: SoulRune
 Section: Tweaks

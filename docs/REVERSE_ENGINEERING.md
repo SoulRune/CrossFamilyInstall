@@ -2,7 +2,7 @@
 
 > **Status: the symbol has already been found and is wired up in `Tweak.xm`**
 > (`MIIsApplicableToCurrentDeviceFamilyWithError`, see `README.md`). This file is a
-> log of how we found it (frida-trace → hooking `NSError` creation → backtrace).
+> log of how it was found (frida-trace -> hooking `NSError` creation -> backtrace).
 > Kept as a reference in case the symbol turns out to be different on another iOS
 > version and the hunt needs to be repeated - the steps below still apply.
 
@@ -57,7 +57,7 @@ at all), fall back to plain symbol-name tracing plus `strings`:
 Take a known iPad-only or tvOS IPA (`UIDeviceFamily = [2]` or `[3]` in Info.plist) and
 try to install it on iPhone by any means:
 - `ipainstaller app.ipa` (ships with AppSync Unified via SSH/Filza),
-- or straight through `installd` via any GUI manager (Filza → tap the .ipa).
+- or straight through `installd` via any GUI manager (Filza -> tap the .ipa).
 
 The install should fail. Note the exact error text/code - it's a `grep` hint for step 5.
 
@@ -111,7 +111,7 @@ allows) for the function/method that references it.
 ### Step 6. Wire the symbol into Tweak.xm - already done
 As of this file, the found symbol (`MIIsApplicableToCurrentDeviceFamilyWithError`,
 `InstalledContentLibrary`) is already wired into `Tweak.xm`. If the function name turns
-out different on another iOS version, repeat steps 1–5 (or Method A) and replace
+out different on another iOS version, repeat steps 1-5 (or Method A) and replace
 `TARGET_SYMBOL` in `Tweak.xm`.
 
 ## In-memory verdict cache
@@ -136,5 +136,5 @@ set of system frameworks - they will most likely just crash on launch on iOS. Co
 via crash log: `dyld` refuses to load an embedded framework built for tvOS into an iOS
 process ("wrong platform to load into process"), which is a separate, deeper check than
 `UIDeviceFamily` and lives inside `dyld` itself, not `installd`. The family patch only
-answers "does it install", not "does it run". iPhone ↔ iPad shares the same underlying
+answers "does it install", not "does it run". iPhone and iPad shares the same underlying
 platform/UIKit, so the odds of a fully working result are much better there.

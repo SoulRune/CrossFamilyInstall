@@ -6,19 +6,19 @@ below - it matters more here than in a typical tweak**. These steps target plain
 Debian, including **WSL Debian** on Windows. (GitHub Actions CI does the same thing
 automatically - see `.github/workflows/build.yml`.)
 
-## ⚠️ installd is a system daemon, not a regular app
+## installd is a system daemon, not a regular app
 
 Unlike tweaks that hook regular App Store apps (where an arm64-only build is fine on
-any device), our target is **`installd`**, a system daemon. On A12+ devices (iPhone XS
+any device), the target is **`installd`**, a system daemon. On A12+ devices (iPhone XS
 and newer), system processes - SpringBoard, daemons, `Preferences` - run as **arm64e**,
 not arm64. A Linux-toolchain arm64-only build **will not inject into `installd` on such
 devices** - the tweak will silently do nothing (you'll see "symbol NOT FOUND" in the
 log, or nothing at all - no injection happens).
 
 - **A11 or older** (iPhone 8/X, the iOS ceiling for these models) - arm64-only with
-  Linux is fine, follow steps 0–3 below.
+  Linux is fine, follow steps 0-3 below.
 - **A12 or newer** - an arm64e slice is required; build on macOS (section below) or use
-  a prebuilt CI artifact (Actions → latest run → artifact).
+  a prebuilt CI artifact (Actions -> latest run -> artifact).
 
 ## 0. (Windows only) Install WSL Debian
 
@@ -143,7 +143,7 @@ make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME= ARCHS="arm64 arm64e"    # root
 
 Don't have a Mac? Not a problem - **GitHub Actions CI does exactly this** on every
 push/PR, free for a public repo. Grab the built `.deb`s (arm64+arm64e, both schemes)
-from the **Actions → latest run → Artifacts** tab, or from **Releases** if a tag was
+from the **Actions -> latest run -> Artifacts** tab, or from **Releases** if a tag was
 pushed.
 
 ## 4. Install on device
@@ -153,7 +153,7 @@ scp packages/*.deb mobile@<device-ip>:/var/mobile/
 ssh root@<device-ip> 'dpkg -i /var/mobile/com.soulrune.crossfamilyinstall_*.deb; launchctl kickstart -k user/foreground/com.apple.mobile.installd'
 ```
 
-Then: **Settings → CrossFamilyInstall** → turn the switch on.
+Then: **Settings -> CrossFamilyInstall** -> turn the switch on.
 
 ## Troubleshooting
 
@@ -166,5 +166,7 @@ Then: **Settings → CrossFamilyInstall** → turn the switch on.
   (posts a Darwin notification, the tweak exits installd itself so launchd relaunches
   it). If you're testing over SSH instead, you can trigger the same thing directly:
   `killall -9 installd` (as root) - `launchd` will restart it. Either way, `installd`
-  re-reads the preferences file fresh on every check, so there's no cache to go stale
-  even between restarts.
+  re-checks the state file (`/var/tmp/com.soulrune.crossfamilyinstall.state`) on every
+  compatibility check, so a change made while it wasn't running is still picked up.
+  To inspect it: `cat /var/tmp/com.soulrune.crossfamilyinstall.state` (bitmask:
+  1 = family, 2 = device model, 4 = iOS version) and `ls -l` it - it should be `-rw-rw-rw-`.

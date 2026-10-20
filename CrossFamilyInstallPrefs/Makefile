@@ -7,7 +7,10 @@ include $(THEOS)/makefiles/common.mk
 
 BUNDLE_NAME = CrossFamilyInstallPrefs
 
-CrossFamilyInstallPrefs_FILES = RootListController.mm
+CrossFamilyInstallPrefs_FILES = RootListController.mm \
+    CFISpoofStore.m CFISpoofListBase.m \
+    CFIAppsTableController.m CFIAppSpoofController.m \
+    CFIBulkSpoofController.m CFISpoofPresets.m
 CrossFamilyInstallPrefs_INSTALL_PATH = /Library/PreferenceBundles
 CrossFamilyInstallPrefs_FRAMEWORKS = UIKit CoreGraphics
 CrossFamilyInstallPrefs_PRIVATE_FRAMEWORKS = Preferences

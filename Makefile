@@ -16,13 +16,23 @@ FOR_RELEASE = 1
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = CrossFamilyInstall
+# Two dylibs from one package:
+#   CrossFamilyInstall - injected into installd only (installer-level checks).
+#   CrossFamilySpoof   - injected into UIKit apps, but only hooks the apps
+#                        enabled under Per-App Spoofing (see Spoof.xm).
+TWEAK_NAME = CrossFamilyInstall CrossFamilySpoof
 
 CrossFamilyInstall_FILES = Tweak.xm
 CrossFamilyInstall_CFLAGS = -fobjc-arc
 CrossFamilyInstall_LIBRARIES = substrate
 CrossFamilyInstall_PRIVATE_FRAMEWORKS = MobileInstallation CoreServices InstalledContentLibrary
 CrossFamilyInstall_LDFLAGS = -Wl,-platform_version,ios,14.0,16.5
+
+CrossFamilySpoof_FILES = Spoof.xm
+CrossFamilySpoof_CFLAGS = -fobjc-arc
+CrossFamilySpoof_FRAMEWORKS = UIKit Foundation
+CrossFamilySpoof_LIBRARIES = substrate
+CrossFamilySpoof_LDFLAGS = -Wl,-platform_version,ios,14.0,16.5
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 

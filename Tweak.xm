@@ -2,10 +2,15 @@
 #import <substrate.h>
 #import <sys/sysctl.h>
 #import <stdlib.h>
+#import <objc/runtime.h>
+#import <mach-o/dyld.h>
+#import <dlfcn.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <sys/stat.h>
+#import <os/lock.h>
 
-// installd is a headless daemon with no UIKit, so we read the version via
-// sysctlbyname instead of UIDevice (avoids pulling in a framework the
-// process never loads).
+// installd has no UIKit, so the version comes from sysctl.
 static NSString *CrossFamilyOSVersion(void) {
     size_t size = 0;
     if (sysctlbyname("kern.osproductversion", NULL, &size, NULL, 0) != 0 || size == 0) {
@@ -25,68 +30,127 @@ static NSString *CrossFamilyOSVersion(void) {
 // STATE / TOGGLE
 // ==========================================================================
 //
-// Why this is NOT AutoRotate's plist-file scheme, despite that being the
-// reference implementation for this project: AutoRotate's dylib is injected
-// into UIKit apps, which run as `mobile`, so reading
-// /var/mobile/Library/Preferences/<domain>.plist is reading their own user's
-// preferences directory - trivially permitted. Our dylib lives inside
-// installd, a SANDBOXED ROOT DAEMON. Sandbox profiles apply on top of UID, so
-// being root does not grant it read access to /var/mobile/Library/Preferences
-// - which is exactly why the toggle kept having no effect even when the plist
-// was demonstrably written correctly and installd was restarted as root.
-//
-// So the state is delivered over Darwin notifications instead: those cross
-// sandbox and UID boundaries unconditionally, which is precisely why they're
-// the standard IPC for this situation. The Settings panel posts enable/disable;
-// we hold the state in memory. For persistence across installd restarts we
-// write a copy to a file installd itself owns and wrote - no cross-process
-// permission question can arise for a file the reading process created.
+// installd is a sandboxed root daemon and can't read the panel's plist in
+// /var/mobile/Library/Preferences. Instead:
+//  1. A state file in /var/tmp, re-checked (one stat) on every compatibility
+//     check, so a switch flipped while installd wasn't running still applies.
+//  2. Darwin notifications update a running installd right away.
+// Both sides write the file in place: /var/tmp is sticky, so a rename over the
+// other side's file would be refused. installd keeps it at mode 0666.
 
-static BOOL gEnabled = NO;
+// The state is a bitmask, one bit per check that can be skipped.
 
-static NSString *CrossFamilyStatePath(void) {
-    // Written and read exclusively by installd itself.
-    return @"/var/tmp/com.soulrune.crossfamilyinstall.state";
+typedef NS_OPTIONS(unsigned int, CrossFamilyFlags) {
+    CrossFamilyFlagFamily   = 1u << 0,  // UIDeviceFamily (iPhone/iPad/tvOS)
+    CrossFamilyFlagModel    = 1u << 1,  // device model / UIRequiredDeviceCapabilities / UISupportedDevices
+    CrossFamilyFlagOS       = 1u << 2,  // MinimumOSVersion
+};
+
+static const char *const kCrossFamilyStatePath = "/var/tmp/com.soulrune.crossfamilyinstall.state";
+
+static unsigned int gFlags = 0;
+static os_unfair_lock gStateLock = OS_UNFAIR_LOCK_INIT;
+// Identity of the file version gFlags was last loaded from.
+static BOOL gStateSeen = NO;
+static ino_t gStateIno = 0;
+static off_t gStateSize = 0;
+static struct timespec gStateMtime = {0, 0};
+
+static BOOL CrossFamilyReadStateFile(unsigned int *out) {
+    int fd = open(kCrossFamilyStatePath, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NO;
+    char buf[32] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return NO;                 // missing, or caught mid-rewrite
+    char *end = NULL;
+    unsigned long value = strtoul(buf, &end, 10);
+    if (end == buf) return NO;             // garbage: keep the previous state
+    *out = (unsigned int)value;
+    return YES;
 }
 
-static void CrossFamilyPersistState(void) {
-    NSString *value = gEnabled ? @"1" : @"0";
-    NSError *error = nil;
-    BOOL ok = [value writeToFile:CrossFamilyStatePath()
-                      atomically:YES
-                        encoding:NSUTF8StringEncoding
-                           error:&error];
-    NSLog(@"[CrossFamilyInstall] persist state=%@ -> %@ (%@)",
-          value, ok ? @"OK" : @"FAILED", ok ? @"" : error.localizedDescription);
+// In place, mode 0666 (see above).
+static BOOL CrossFamilyWriteStateFile(unsigned int flags) {
+    int fd = open(kCrossFamilyStatePath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0) {
+        NSLog(@"[CrossFamilyInstall] state file open failed: %s", strerror(errno));
+        return NO;
+    }
+    fchmod(fd, 0666);                      // undo umask; harmless when not the owner
+    char buf[16];
+    int len = snprintf(buf, sizeof(buf), "%u\n", flags);
+    BOOL ok = write(fd, buf, (size_t)len) == len;
+    close(fd);
+    return ok;
 }
+
+// Must be called with gStateLock held.
+static void CrossFamilyRefreshLocked(void) {
+    struct stat st;
+    if (stat(kCrossFamilyStatePath, &st) != 0) return;   // no file: keep in-memory state
+    if (gStateSeen && st.st_ino == gStateIno && st.st_size == gStateSize &&
+        st.st_mtimespec.tv_sec == gStateMtime.tv_sec &&
+        st.st_mtimespec.tv_nsec == gStateMtime.tv_nsec) {
+        return;                                          // unchanged since last read
+    }
+    unsigned int flags = 0;
+    if (!CrossFamilyReadStateFile(&flags)) return;       // retry on the next check
+    gStateSeen = YES;
+    gStateIno = st.st_ino;
+    gStateSize = st.st_size;
+    gStateMtime = st.st_mtimespec;
+    if (flags != gFlags) {
+        NSLog(@"[CrossFamilyInstall] state file changed: flags 0x%x -> 0x%x", gFlags, flags);
+        gFlags = flags;
+    }
+}
+
+static unsigned int CrossFamilyCurrentFlags(void) {
+    os_unfair_lock_lock(&gStateLock);
+    CrossFamilyRefreshLocked();
+    unsigned int flags = gFlags;
+    os_unfair_lock_unlock(&gStateLock);
+    return flags;
+}
+
+static BOOL CrossFamilyFlagIsSet(CrossFamilyFlags flag) {
+    return (CrossFamilyCurrentFlags() & flag) != 0;
+}
+
+static void CrossFamilySetFlag(CrossFamilyFlags flag, BOOL on, const char *what) {
+    os_unfair_lock_lock(&gStateLock);
+    CrossFamilyRefreshLocked();            // don't clobber bits set via the file meanwhile
+    if (on) gFlags |= flag; else gFlags &= ~flag;
+    unsigned int flags = gFlags;
+    BOOL ok = CrossFamilyWriteStateFile(flags);
+    os_unfair_lock_unlock(&gStateLock);
+    NSLog(@"[CrossFamilyInstall] %s -> %s (flags=0x%x, persist %@)",
+          what, on ? "ON" : "OFF", flags, ok ? @"OK" : @"FAILED");
+}
+
+// One Darwin notification per switch position.
+#define CFI_OBSERVER(fn, flag, on, label) \
+    static void fn(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef u) { \
+        CrossFamilySetFlag(flag, on, label); \
+    }
+CFI_OBSERVER(CrossFamilyEnableReceived,       CrossFamilyFlagFamily, YES, "ignore device family")
+CFI_OBSERVER(CrossFamilyDisableReceived,      CrossFamilyFlagFamily, NO,  "ignore device family")
+CFI_OBSERVER(CrossFamilyModelEnableReceived,  CrossFamilyFlagModel,  YES, "ignore device model")
+CFI_OBSERVER(CrossFamilyModelDisableReceived, CrossFamilyFlagModel,  NO,  "ignore device model")
+CFI_OBSERVER(CrossFamilyOSEnableReceived,     CrossFamilyFlagOS,     YES, "ignore OS version")
+CFI_OBSERVER(CrossFamilyOSDisableReceived,    CrossFamilyFlagOS,     NO,  "ignore OS version")
+#undef CFI_OBSERVER
 
 static void CrossFamilyLoadPersistedState(void) {
-    NSString *value = [NSString stringWithContentsOfFile:CrossFamilyStatePath()
-                                                encoding:NSUTF8StringEncoding
-                                                   error:NULL];
-    gEnabled = [[value stringByTrimmingCharactersInSet:
-                    [NSCharacterSet whitespaceAndNewlineCharacterSet]] isEqualToString:@"1"];
-    NSLog(@"[CrossFamilyInstall] loaded persisted state -> enabled=%d", gEnabled);
-}
-
-static void CrossFamilyEnableReceived(CFNotificationCenterRef center, void *observer,
-                                       CFStringRef name, const void *object,
-                                       CFDictionaryRef userInfo) {
-    gEnabled = YES;
-    NSLog(@"[CrossFamilyInstall] enable notification received");
-    CrossFamilyPersistState();
-}
-
-static void CrossFamilyDisableReceived(CFNotificationCenterRef center, void *observer,
-                                        CFStringRef name, const void *object,
-                                        CFDictionaryRef userInfo) {
-    gEnabled = NO;
-    NSLog(@"[CrossFamilyInstall] disable notification received");
-    CrossFamilyPersistState();
+    // Settings can't write a root-owned 0644 file; installd owns it, so fix it here
+    chmod(kCrossFamilyStatePath, 0666);
+    unsigned int flags = CrossFamilyCurrentFlags();
+    NSLog(@"[CrossFamilyInstall] loaded persisted state -> flags=0x%x", flags);
 }
 
 static BOOL CrossFamilyIsEnabled(void) {
-    return gEnabled;
+    return CrossFamilyFlagIsSet(CrossFamilyFlagFamily);
 }
 
 // ==========================================================================
@@ -96,19 +160,16 @@ static BOOL CrossFamilyIsEnabled(void) {
 static void CrossFamilyRestartRequested(CFNotificationCenterRef center, void *observer,
                                          CFStringRef name, const void *object,
                                          CFDictionaryRef userInfo) {
-    // A process can always exit itself - no privilege boundary involved,
-    // unlike asking launchctl (from the mobile-owned Settings process) to
-    // kickstart a root daemon. launchd relaunches installd automatically,
-    // which also clears its in-memory install-verdict cache.
+    // launchd starts installd again, which also clears its verdict cache
     NSLog(@"[CrossFamilyInstall] restart requested - exiting so launchd respawns installd");
     exit(0);
 }
 
 // ==========================================================================
-// THE ACTUAL HOOK - found via tracing (see errors.log / REVERSE_ENGINEERING.md):
+// DEVICE FAMILY CHECK (see docs/REVERSE_ENGINEERING.md)
 //
-// domain: MIInstallerErrorDomain, code: 10
-// FunctionName = MIIsApplicableToCurrentDeviceFamilyWithError
+// MIInstallerErrorDomain code 10, raised by
+// MIIsApplicableToCurrentDeviceFamilyWithError
 // Module: /System/Library/PrivateFrameworks/InstalledContentLibrary.framework
 //
 // Call chain:
@@ -121,21 +182,10 @@ static void CrossFamilyRestartRequested(CFNotificationCenterRef center, void *ob
 
 #define TARGET_SYMBOL "MIIsApplicableToCurrentDeviceFamilyWithError"
 
-// NOTE on the signature: the exact argument count/types haven't been confirmed
-// yet (see inspect_family_check.js - run it and check the output to pin this
-// down precisely). In the meantime this declares six generic pointer-sized
-// parameters (matching x0-x5 under AAPCS64) instead of void(void). This isn't
-// just cosmetic: a bare void(void) hook has NO named parameters, so the
-// compiler has no reason to preserve the caller's original x0-x3 register
-// values across any function calls inside our hook body (e.g. the call to
-// CrossFamilyIsEnabled()) - those registers are caller-saved and get silently
-// clobbered, so calling through to OrigFamilyCheck() on the disabled path ends
-// up forwarding garbage instead of the real arguments. Declaring named
-// parameters (even generically typed) forces the compiler to spill/reload them
-// correctly around calls, which is required for the disabled/pass-through path
-// to behave correctly. Extra unused parameter slots beyond the real arity are
-// harmless. The enabled/bypass path (`return YES`) never touches these at all,
-// so it's unaffected either way.
+// The exact signature isn't known, so six pointer-sized parameters (x0-x5) are
+// declared and passed on unchanged. Without named parameters the compiler
+// wouldn't keep the caller's registers across the hook's own calls, and the original
+// would get garbage when the toggle is off.
 typedef BOOL (*OrigFamilyCheck_t)(void *a0, void *a1, void *a2, void *a3, void *a4, void *a5);
 static OrigFamilyCheck_t OrigFamilyCheck;
 
@@ -146,6 +196,164 @@ static BOOL Replaced_FamilyCheck(void *a0, void *a1, void *a2, void *a3, void *a
         return YES;
     }
     return OrigFamilyCheck ? OrigFamilyCheck(a0, a1, a2, a3, a4, a5) : NO;
+}
+
+// Most specific first: the InstalledContentLibrary image (behaves the same on
+// every hooking library), then dlsym, then a search of all images.
+static void *CrossFamilyFindFamilySymbol(const char **how) {
+    static const char *const kICLPath =
+        "/System/Library/PrivateFrameworks/InstalledContentLibrary.framework/InstalledContentLibrary";
+    void *sym = NULL;
+
+    MSImageRef image = MSGetImageByName(kICLPath);
+    if (image) {
+        sym = MSFindSymbol(image, "_" TARGET_SYMBOL);
+        if (sym) { *how = "MSFindSymbol(InstalledContentLibrary)"; return sym; }
+    } else {
+        NSLog(@"[CrossFamilyInstall] InstalledContentLibrary image not found by path, falling back");
+    }
+
+    sym = dlsym(RTLD_DEFAULT, TARGET_SYMBOL);
+    if (sym) { *how = "dlsym"; return sym; }
+
+    sym = MSFindSymbol(NULL, "_" TARGET_SYMBOL);
+    if (!sym) sym = MSFindSymbol(NULL, TARGET_SYMBOL);   // some runtimes want no underscore
+    if (sym) { *how = "MSFindSymbol(NULL)"; return sym; }
+    return NULL;
+}
+
+// ==========================================================================
+// DEVICE MODEL / OS VERSION CHECKS (+ ObjC-level family fallback)
+// ==========================================================================
+//
+// installd asks the bundle a series of "applicable to this device?" questions,
+// ObjC methods shaped like
+//     - (BOOL)isApplicableToCurrent<Thing>WithError:(NSError **)error;
+//     - (BOOL)isApplicableTo<Thing>:(id)value error:(NSError **)error;
+// Names change between iOS versions, so the classes are scanned at load and a
+// method is wrapped only if both its name and its exact type encoding match.
+// A wrong guess means "not hooked", never a crash. Every candidate is logged:
+//   [CrossFamilyInstall] candidate -[MIBundle isApplicableToCurrentOSVersionWithError:] B24@0:8^@16 -> hooked (os)
+
+typedef BOOL (*CFIErrIMP)(id, SEL, NSError **);
+typedef BOOL (*CFIArgErrIMP)(id, SEL, id, NSError **);
+
+// Which switch a selector belongs to, by name. 0 == none.
+static CrossFamilyFlags CrossFamilyFlagForSelector(NSString *name) {
+    if (!([name hasPrefix:@"isApplicable"] || [name hasPrefix:@"isCompatible"])) return 0;
+    NSString *lower = name.lowercaseString;
+    // Family: a backup for the C hook, in case that function is renamed or
+    // inlined on some iOS version
+    if ([lower containsString:@"devicefamily"]) return CrossFamilyFlagFamily;
+    if ([lower containsString:@"osversion"] || [lower containsString:@"systemversion"] ||
+        [lower containsString:@"minimumos"] || [lower containsString:@"platformversion"]) {
+        return CrossFamilyFlagOS;
+    }
+    if ([lower containsString:@"capabilit"] || [lower containsString:@"supporteddevice"] ||
+        [lower containsString:@"devicemodel"] || [lower containsString:@"devicetype"] ||
+        [lower containsString:@"hardware"]) {
+        return CrossFamilyFlagModel;
+    }
+    return 0;
+}
+
+// Type encoding with the offset digits stripped: "B24@0:8^@16" -> "B@:^@".
+static NSString *CrossFamilyShape(Method m) {
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc) return @"";
+    NSMutableString *out = [NSMutableString string];
+    for (const char *p = enc; *p; p++) {
+        if (*p < '0' || *p > '9') [out appendFormat:@"%c", *p];
+    }
+    return out;
+}
+
+static const char *CrossFamilyFlagLabel(CrossFamilyFlags f) {
+    switch (f) {
+        case CrossFamilyFlagFamily: return "family";
+        case CrossFamilyFlagOS:     return "os";
+        default:                    return "model";
+    }
+}
+
+static BOOL CrossFamilyWrapMethod(Class cls, Method m, CrossFamilyFlags flag) {
+    SEL sel = method_getName(m);
+    NSString *shape = CrossFamilyShape(m);
+    // 'B' (bool) on arm64; 'c' (signed char BOOL) accepted just in case.
+    BOOL oneArg = [shape isEqualToString:@"B@:^@"] || [shape isEqualToString:@"c@:^@"];
+    BOOL twoArg = [shape isEqualToString:@"B@:@^@"] || [shape isEqualToString:@"c@:@^@"];
+    if (!oneArg && !twoArg) return NO;
+
+    NSString *where = [NSString stringWithFormat:@"-[%s %s]", class_getName(cls), sel_getName(sel)];
+    IMP orig = method_getImplementation(m);
+    id block;
+    if (oneArg) {
+        CFIErrIMP o = (CFIErrIMP)orig;
+        block = ^BOOL(id self, NSError **error) {
+            if (CrossFamilyFlagIsSet(flag)) {
+                NSLog(@"[CrossFamilyInstall] %@ bypassed (%s)", where, CrossFamilyFlagLabel(flag));
+                if (error) *error = nil;
+                return YES;
+            }
+            return o(self, sel, error);
+        };
+    } else {
+        CFIArgErrIMP o = (CFIArgErrIMP)orig;
+        block = ^BOOL(id self, id arg, NSError **error) {
+            if (CrossFamilyFlagIsSet(flag)) {
+                NSLog(@"[CrossFamilyInstall] %@ bypassed (%s)", where, CrossFamilyFlagLabel(flag));
+                if (error) *error = nil;
+                return YES;
+            }
+            return o(self, sel, arg, error);
+        };
+    }
+    method_setImplementation(m, imp_implementationWithBlock(block));
+    return YES;
+}
+
+static unsigned CrossFamilyHookImage(const char *image) {
+    unsigned hooked = 0, classCount = 0;
+    const char **names = objc_copyClassNamesForImage(image, &classCount);
+    if (!names) return 0;
+    for (unsigned i = 0; i < classCount; i++) {
+        Class cls = objc_getClass(names[i]);
+        if (!cls) continue;
+        unsigned methodCount = 0;
+        // Instance methods defined directly on this class only - subclasses
+        // get their own pass, so nothing is wrapped twice.
+        Method *methods = class_copyMethodList(cls, &methodCount);
+        for (unsigned j = 0; j < methodCount; j++) {
+            NSString *name = NSStringFromSelector(method_getName(methods[j]));
+            CrossFamilyFlags flag = CrossFamilyFlagForSelector(name);
+            if (!flag) continue;
+            BOOL ok = CrossFamilyWrapMethod(cls, methods[j], flag);
+            if (ok) hooked++;
+            NSLog(@"[CrossFamilyInstall] candidate -[%s %@] %s -> %@",
+                  names[i], name, method_getTypeEncoding(methods[j]) ?: "?",
+                  ok ? [NSString stringWithFormat:@"hooked (%s)", CrossFamilyFlagLabel(flag)]
+                     : @"skipped (unexpected signature)");
+        }
+        free(methods);
+    }
+    free(names);
+    return hooked;
+}
+
+static void CrossFamilyHookCompatibilityChecks(NSString *osVersion) {
+    unsigned hooked = 0;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *image = _dyld_get_image_name(i);
+        if (!image) continue;
+        // i == 0 is installd's own executable.
+        if (i == 0 || strstr(image, "/InstalledContentLibrary.framework/") ||
+                      strstr(image, "/MobileInstallation.framework/")) {
+            hooked += CrossFamilyHookImage(image);
+        }
+    }
+    NSLog(@"[CrossFamilyInstall] ObjC checks: %u method(s) hooked on iOS %@%@", hooked, osVersion,
+          hooked ? @"" : @" - ignore model/OS switches will have no effect");
 }
 
 // ==========================================================================
@@ -164,25 +372,33 @@ static BOOL Replaced_FamilyCheck(void *a0, void *a1, void *a2, void *a3, void *a
         CFNotificationCenterAddObserver(darwin, NULL, CrossFamilyDisableReceived,
             CFSTR("com.soulrune.crossfamilyinstall/disable"),
             NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(darwin, NULL, CrossFamilyModelEnableReceived,
+            CFSTR("com.soulrune.crossfamilyinstall/model/enable"),
+            NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(darwin, NULL, CrossFamilyModelDisableReceived,
+            CFSTR("com.soulrune.crossfamilyinstall/model/disable"),
+            NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(darwin, NULL, CrossFamilyOSEnableReceived,
+            CFSTR("com.soulrune.crossfamilyinstall/os/enable"),
+            NULL, CFNotificationSuspensionBehaviorCoalesce);
+        CFNotificationCenterAddObserver(darwin, NULL, CrossFamilyOSDisableReceived,
+            CFSTR("com.soulrune.crossfamilyinstall/os/disable"),
+            NULL, CFNotificationSuspensionBehaviorCoalesce);
 
         CrossFamilyLoadPersistedState();
 
         NSString *osVersion = CrossFamilyOSVersion();
 
-        // MSFindSymbol(NULL, ...) searches across all loaded images - that's
-        // enough, since InstalledContentLibrary is already loaded by the time
-        // installd starts (confirmed by the fact that errors.log's backtrace
-        // includes calls from this framework on the normal install path).
-        void *sym = MSFindSymbol(NULL, "_" TARGET_SYMBOL);
-        if (!sym) {
-            // some runtimes expect the symbol name without a leading underscore
-            sym = MSFindSymbol(NULL, TARGET_SYMBOL);
-        }
+        const char *how = NULL;
+        void *sym = CrossFamilyFindFamilySymbol(&how);
         if (sym) {
             MSHookFunction(sym, (void *)Replaced_FamilyCheck, (void **)&OrigFamilyCheck);
-            NSLog(@"[CrossFamilyInstall] hooked %s at %p (iOS %@)", TARGET_SYMBOL, sym, osVersion);
+            NSLog(@"[CrossFamilyInstall] hooked %s at %p via %s (iOS %@)", TARGET_SYMBOL, sym, how, osVersion);
         } else {
-            NSLog(@"[CrossFamilyInstall] symbol %s NOT FOUND on iOS %@ - tweak inactive", TARGET_SYMBOL, osVersion);
+            NSLog(@"[CrossFamilyInstall] symbol %s NOT FOUND on iOS %@ - C-level family hook inactive (ObjC fallback below may still cover it)", TARGET_SYMBOL, osVersion);
         }
+
+        // Independent of the family hook - each part fails safe on its own.
+        CrossFamilyHookCompatibilityChecks(osVersion);
     }
 }
